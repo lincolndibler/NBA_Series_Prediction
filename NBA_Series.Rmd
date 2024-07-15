@@ -1,0 +1,1111 @@
+---
+title: "NBA_Series_Prediction"
+author: "Lincoln Dibler"
+date: "2024-07-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Step 1: Data Formatting
+
+## Part A.) Formatting and Feature Engineering Player Data
+
+* Plan: Create Player Data specific features. We will eventually aggregate these stats up to the series level.
+
+
+```{r}
+# Player Data Functions + Libraries
+
+library(zoo)
+library(dplyr)
+library(tidyverse)
+
+custom_rollsum <- function(x, k) {
+  n <- length(x)
+  result <- rep(NA, n)
+  for (i in 1:n) {
+    if (i < k) {
+      result[i] <- sum(x[1:i], na.rm = TRUE)
+    } else {
+      result[i] <- sum(x[(i - k + 1):i], na.rm = TRUE)
+    }
+  }
+  return(result)
+}
+
+
+player_data <- read_csv("C:/Users/linco/Documents/NBA_Series/player_game_data.csv")
+team_data <- read_csv("C:/Users/linco/Documents/NBA_Series/team_game_data.csv")
+```
+
+```{r}
+# Create some more comprehensive player_stats
+player_data <- player_data %>%
+  mutate(fg_percent = (fgmade / fgattempted),
+         fg3_percent = (fg3made / fg3attempted),
+         ft_percent = (ftmade / ftattempted),
+         total_rebounds = (reboffensive + rebdefensive),
+         rebound_percent = total_rebounds / (offensivereboundchances + defensivereboundchances),
+         assist_turnover_ratio = ifelse(turnovers > 0, assists / turnovers, NA),
+         PER = (points + total_rebounds + assists + steals + blocks - fgmissed - ftmissed - turnovers),
+         efg_percent = (fgmade + 0.5 * fg3made) / fgattempted,
+         ts_percent = points / 2 * (fgattempted + 0.44 * ftattempted),
+         turnover_percent = turnovers / (fgattempted + 0.44 * ftattempted + turnovers),
+         ORTG = points / (offensivepossessions / 100),
+         DRTG = points / (defensivepossessions / 100),
+         net_rating = ORTG + DRTG,
+         steal_percent = steals / defensivepossessions,
+         block_percent = blocks / opponentteamfg2attempted,
+         ft_rate = ftattempted / fgattempted,
+         OBPM = (points + assists + reboffensive + steals + blocks - fgmissed - ftmissed - turnovers) / (seconds / 60),
+         minutes = seconds / 60,
+         won = ifelse(teampoints > opponentteampoints, 1, 0),
+         points_per_minutes = points / minutes)
+
+         
+# Steps for creating USG%
+team_stats <- player_data %>%
+  group_by(nbagameid, nbateamid) %>%
+  summarise(
+    team_shotattempts = sum(shotattempts),
+    team_turnovers = sum(turnovers)
+  )
+
+player_data <- player_data %>%
+  left_join(team_stats, by = c("nbagameid", "nbateamid"))
+
+player_data <- player_data %>%
+  mutate(
+    USG_percent = (shotattempts + turnovers) / (team_shotattempts + team_turnovers)
+  )
+
+player_data <- player_data %>%
+  select(-team_shotattempts, -team_turnovers)
+
+# Steps for creating PIE
+game_stats <- player_data %>%
+  group_by(nbagameid) %>%
+  summarise(
+    game_points = sum(points),
+    game_fgmade = sum(fgmade),
+    game_ftmade = sum(ftmade),
+    game_fgattempted = sum(fgattempted),
+    game_ftattempted = sum(ftattempted),
+    game_rebdefensive = sum(rebdefensive),
+    game_reboffensive = sum(reboffensive),
+    game_assists = sum(assists),
+    game_steals = sum(steals),
+    game_blocks = sum(blocks),
+    game_pf = sum(defensivefouls + offensivefouls + shootingfouls),
+    game_turnovers = sum(turnovers)
+  )
+
+player_data <- player_data %>%
+  left_join(game_stats, by = "nbagameid")
+
+player_data <- player_data %>%
+  mutate(
+    PIE = (points + fgmade + ftmade - fgattempted - ftattempted + rebdefensive + reboffensive / 2 + assists + steals + blocks / 2 - (defensivefouls + offensivefouls + shootingfouls) - turnovers) /
+          (game_points + game_fgmade + game_ftmade - game_fgattempted - game_ftattempted + game_rebdefensive + game_reboffensive / 2 + game_assists + game_steals + game_blocks / 2 - game_pf - game_turnovers)
+  )
+
+player_data <- player_data %>%
+  select(-game_points, -game_fgmade, -game_ftmade, -game_fgattempted, -game_ftattempted, -game_rebdefensive, -game_reboffensive, -game_assists, -game_steals, -game_blocks, -game_pf, -game_turnovers)
+
+# Steps for creating DRTG
+aggregated_DRTG <- player_data %>%
+  group_by(nbagameid) %>%
+  summarise(total_defensive_possessions = sum(defensivepossessions),
+            total_opponent_team_fg2_attempted = sum(opponentteamfg2attempted))
+
+player_data <- player_data %>%
+  left_join(aggregated_DRTG, by = "nbagameid")
+
+player_data <- player_data %>%
+  mutate(DBPM = (steals + blocks) / (total_defensive_possessions / 100) + 
+                (defensivepossessions - (points / 2)) / total_opponent_team_fg2_attempted,
+         
+         BPM = OBPM + DBPM)
+
+player_data <- player_data %>%
+  select(-total_defensive_possessions, -total_opponent_team_fg2_attempted)
+
+# Steps for creating Assist Percentage
+aggregated_assist <- player_data %>%
+  group_by(nbagameid) %>%
+  summarise(team_fgmade = sum(fgmade))
+
+player_data <- player_data %>%
+  left_join(aggregated_assist, by = "nbagameid")
+
+player_data <- player_data %>%
+  mutate(assist_percent = (assists * 100) / ((minutes * team_fgmade) - fgmade))
+
+player_data <- player_data %>%
+  select(-team_fgmade)
+
+# Steps for creating Injury Features
+player_data <- player_data %>%
+  group_by(season, nbapersonid) %>%
+  arrange(nbapersonid, gamedate) %>%
+  mutate(cumulative_missed = cumsum(missed))
+
+player_data <- player_data %>%
+  arrange(gamedate) %>%
+  group_by(season, nbapersonid) %>%
+  mutate(total_games = row_number(),
+         injury_frequency = (cumulative_missed / total_games) * 100)
+
+player_data <- player_data %>%
+  group_by(season, nbapersonid) %>%
+  arrange(nbapersonid, gamedate) %>%
+  mutate(recent_injury_status = custom_rollsum(missed, k = 5))
+
+# Steps for creating NBA game count
+player_data <- player_data %>%
+  arrange(nbapersonid, gamedate) %>%  
+  group_by(nbapersonid) %>%  
+  mutate(
+    games_played_before = row_number() - 1  
+  ) %>%
+  ungroup() 
+
+# Steps for creating playoff game count
+player_data <- player_data %>%
+  arrange(nbapersonid, gamedate) %>%
+  group_by(nbapersonid) %>%
+  mutate(
+    playoff_games_played_before = cumsum(lag(gametype == 4, default = 0))
+  ) %>%
+  ungroup()
+
+
+# Steps for creating Win Ratio
+player_data <- player_data %>%
+  arrange(nbapersonid, gamedate) %>%  
+  group_by(nbapersonid) %>% 
+  mutate(
+    cumulative_wins = cumsum(won),
+    cumulative_games = row_number(),
+    win_ratio_cumsum = cumulative_wins / cumulative_games
+  ) %>%
+  ungroup()
+
+player_data <- player_data %>%
+  select(-cumulative_wins, -cumulative_games)
+```
+
+## Part B.) Aggregating Player Data based on mean starters stats.
+```{r}
+#Aggregating Player Data to Team level
+player_data_aggregate <- player_data %>%
+  group_by(season, gamedate, nbateamid) %>%
+  mutate(
+    avg_starter_fg_percent = mean(fg_percent[starter == 1], na.rm = TRUE),
+    avg_starter_ft_percent = mean(ft_percent[starter == 1], na.rm = TRUE),
+    avg_starter_rebound_percent = mean(rebound_percent[starter == 1], na.rm = TRUE),
+    avg_starter_assist_turnover_ratio = mean(assist_turnover_ratio[starter == 1], na.rm = TRUE),
+    avg_starter_efg_percent = mean(efg_percent[starter==1], na.rm = TRUE),
+    avg_starter_ts_percent = mean(ts_percent[starter == 1], na.rm = TRUE),
+    avg_starter_turnover_percent = mean(turnover_percent[starter == 1], na.rm = TRUE),
+    avg_starter_ORTG = mean(ORTG[starter == 1], na.rm = TRUE),
+    avg_starter_DRTG = mean(DRTG[starter == 1], na.rm = TRUE),
+    avg_starter_net_rating = mean(net_rating[starter == 1], na.rm = TRUE),
+    avg_starter_block_percent = mean(block_percent[starter == 1], na.rm = TRUE),
+    avg_starter_ft_rate = mean(ft_rate[starter == 1], na.rm = TRUE),
+    avg_starter_BPM = mean(BPM[starter == 1], na.rm = TRUE),
+    avg_starter_PIE = mean(PIE[starter == 1], na.rm = TRUE),
+    avg_starter_USG_percent = mean(USG_percent[starter == 1], na.rm = TRUE),
+    avg_starter_assist_percent = mean(assist_percent[starter == 1], na.rm = TRUE),
+    avg_starter_total_games = mean(total_games[starter == 1], na.rm = TRUE),
+    avg_starter_injury_frequency = mean(injury_frequency[starter == 1], na.rm = TRUE),
+    avg_starter_PER = mean(PER[starter == 1], na.rm = TRUE),
+    avg_starter_games_played_before = mean(games_played_before[starter == 1], na.rm=TRUE),
+    avg_starter_playoff_games_played_before = mean(playoff_games_played_before[starter == 1], na.rm = TRUE),
+    avg_starter_win_ratio = mean(win_ratio_cumsum[starter == 1], na.rm = TRUE),
+    avg_starter_points_per_minutes = mean(points_per_minutes[starter == 1], na.rm = TRUE))
+```
+
+
+## Part C.) Formatting and Feature Engineering Team Data
+
+* Overall Plan: Create Team Data specific features. We will eventually aggregate these stats up to the series level.
+
+
+```{r}
+# Team Data Functions
+library(readr)
+library(tidyverse)
+
+
+calculate_cumulative_record_per_season <- function(df, team_col, win_col, loss_col) {
+  df %>%
+    arrange(gamedate) %>%
+    group_by(season, !!sym(team_col)) %>%
+    mutate(cumulative_wins = cumsum(!!sym(win_col)),
+           cumulative_losses = cumsum(!!sym(loss_col)),
+           cumulative_record = paste(cumulative_wins, cumulative_losses, sep = "-")) %>%
+    ungroup()
+}
+
+
+calculate_combined_records <- function(df) {
+  home_records <- df %>%
+    select(season, gamedate, H_team_id, H_win, A_win) %>%
+    rename(team_id = H_team_id, win = H_win, loss = A_win)
+    
+  away_records <- df %>%
+    select(season, gamedate, A_team_id, A_win, H_win) %>%
+    rename(team_id = A_team_id, win = A_win, loss = H_win)
+  
+  combined_records <- bind_rows(home_records, away_records)
+  combined_records <- calculate_cumulative_record_per_season(combined_records, "team_id", "win", "loss")
+  
+  home_records <- combined_records %>%
+    filter(team_id %in% df$H_team_id) %>%
+    rename(H_cumulative_wins = cumulative_wins, H_cumulative_losses = cumulative_losses, H_cumulative_record = cumulative_record)
+  
+  away_records <- combined_records %>%
+    filter(team_id %in% df$A_team_id) %>%
+    rename(A_cumulative_wins = cumulative_wins, A_cumulative_losses = cumulative_losses, A_cumulative_record = cumulative_record)
+  
+  df <- df %>%
+    left_join(home_records, by = c("season", "gamedate", "H_team_id" = "team_id")) %>%
+    left_join(away_records, by = c("season", "gamedate", "A_team_id" = "team_id"))
+  
+  return(df)
+}
+
+
+calculate_last_7_games_sum <- function(wins) {
+  sapply(1:length(wins), function(i) {
+    if (i < 7) {
+      return(sum(wins[1:i]))  
+    } else {
+      return(sum(wins[(i-6):i]))
+    }
+  })
+}
+
+calculate_last_7_games_mean <- function(feature_values) {
+  sapply(1:length(feature_values), function(i) {
+    if (i < 7) {
+      return(mean(feature_values[1:i]))  
+    } else {
+      return(mean(feature_values[(i-6):i]))  
+    }
+  })
+}
+
+```
+
+
+```{r}
+# Filtered so that the model can predict all future series, 2020 playoffs and onwards.
+team_data <- team_data %>%
+  arrange(gamedate)
+
+team_data_home_cols <- team_data %>%
+  filter(off_home == 1) %>%
+  rename(
+    nbagameid = nbagameid,
+    season = season,
+    gametype = gametype,
+    gamedate = gamedate,
+    H_team_id = offensivenbateamid,
+    H_team_name = off_team_name,
+    H_team = off_team,
+    H_win = off_win,
+    H_points = points,
+    H_fgmade = fgmade,
+    H_fg2made = fg2made,
+    H_fg2missed = fg2missed,
+    H_fg2attempted = fg2attempted,
+    H_fg3made = fg3made,
+    H_fg3missed = fg3missed,
+    H_fg3attempted = fg3attempted,
+    H_fgmade = fgmade,
+    H_fgmissed = fgmissed,
+    H_fgattempted = fgattempted,
+    H_ftmade = ftmade,
+    H_ftmissed = ftmissed,
+    H_ftattempted = ftattempted,
+    H_rebound_offensive = reboffensive,
+    H_rebound_chance = reboundchance,
+    H_assists = assists,
+    H_turnovers = turnovers,
+    H_offensivefouls = offensivefouls,
+    H_shooting_fouls_drawn = shootingfoulsdrawn,
+    H_possessions = possessions,
+    H_shotattempts = shotattempts,
+    H_andones = andones,
+    H_shotattemptpoints = shotattemptpoints,
+    A_rebound_defensive = rebdefensive,
+    A_defensivefouls = defensivefouls,
+    A_win = def_win,
+    A_steals = stealsagainst,
+    A_blocks = blocksagainst,
+    H_opponent_id = defensivenbateamid,
+    H_opponent = def_team_name
+  ) 
+
+
+team_data_away_cols <- team_data %>%
+  filter(off_home == 0) %>%
+  rename(
+    nbagameid = nbagameid,
+    A_points = points,
+    A_fgmade = fgmade,
+    A_fg2made = fg2made,
+    A_fg2missed = fg2missed,
+    A_fg2attempted = fg2attempted,
+    A_fg3made = fg3made,
+    A_fg3missed = fg3missed,
+    A_fg3attempted = fg3attempted,
+    A_fgmade = fgmade,
+    A_fgmissed = fgmissed,
+    A_fgattempted = fgattempted,
+    A_ftmade = ftmade,
+    A_ftmissed = ftmissed,
+    A_ftattempted = ftattempted,
+    A_rebound_offensive = reboffensive,
+    A_rebound_chance = reboundchance,
+    A_assists = assists,
+    A_turnovers = turnovers,
+    A_offensivefouls = offensivefouls,
+    A_shooting_fouls_drawn = shootingfoulsdrawn,
+    A_possessions = possessions,
+    A_shotattempts = shotattempts,
+    A_andones = andones,
+    A_shotattemptpoints = shotattemptpoints,
+    H_rebound_defensive = rebdefensive,
+    H_blocks = blocksagainst,
+    H_defensivefouls = defensivefouls,
+    H_steals = stealsagainst,
+    A_opponent_id = defensivenbateamid,
+    A_opponent = def_team_name,
+    A_team_id = offensivenbateamid,
+    A_team_name = off_team_name,
+    A_team = off_team
+    ) 
+
+team_data_singlerow <- team_data_home_cols %>%
+  left_join(team_data_away_cols, by = "nbagameid")
+
+
+team_data_singlerow <- team_data_singlerow %>%
+  mutate(H_fg_percent = (H_fgmade / H_fgattempted),
+         A_fg_percent = (A_fgmade / A_fgattempted),
+         H_fg3_percent = (H_fg3made / H_fg3attempted),
+         A_fg3_percent = (A_fg3made / A_fg3attempted),
+         H_ft_percent = (H_ftmade / H_ftattempted),
+         A_ft_percent = (A_ftmade / A_ftattempted),
+         H_turnover_ratio = (H_assists / H_turnovers),
+         A_turnover_ratio = (A_assists / A_turnovers),
+         H_turnover_percent = (H_turnovers / (H_possessions / 100)),
+         A_turnover_percent = (A_turnovers / (A_possessions / 100)),
+         H_ORTG = H_points / (H_possessions / 100),
+         H_DRTG = A_points / (A_possessions / 100),
+         A_ORTG = A_points / (A_possessions / 100),
+         A_DRTG = H_points / (H_possessions / 100),
+         H_net_rating = (H_ORTG - H_DRTG),
+         A_net_rating = (A_ORTG - A_DRTG),
+         H_steal_percentage = (H_steals / A_possessions),
+         A_steal_percentage = (A_steals / H_possessions),
+         H_block_percentage = (H_blocks / A_fg2attempted),
+         A_block_percentage = (A_blocks / H_fg2attempted),
+         H_efg_percent = (H_fgmade + 0.5 * H_fg3made / H_fgattempted),
+         A_efg_percent = (A_fgmade + 0.5 * A_fg3made / A_fgattempted),
+         H_ts_percent = H_points / (2 * (H_fgattempted + 0.44 * H_ftattempted)),
+         A_ts_percent = A_points / (2 * (A_fgattempted + 0.44 * A_ftattempted)),
+         H_dreb_percent = (H_rebound_defensive / (H_rebound_defensive + A_rebound_defensive)),
+         A_dreb_percent = (A_rebound_defensive / (A_rebound_defensive + H_rebound_defensive)),
+         pace = (48 * ((H_possessions + A_possessions) / (2 * (48 / 5)))),
+         H_ppp = (H_points / H_possessions),
+         A_ppp = (A_points / A_possessions),
+         H_foul_percent = (H_offensivefouls + H_defensivefouls / H_possessions),
+         A_foul_percent = (A_offensivefouls + A_defensivefouls / A_possessions),
+         H_point_differential = (H_points - A_points),
+         A_point_differential = (A_points - H_points))
+
+team_data_singlerow <- team_data_singlerow %>%
+  rename(season = season.x,
+         gametype = gametype.x,
+         gamedate = gamedate.x)
+
+team_data_singlerow <- team_data_singlerow %>%
+  mutate(
+    series_id = ifelse(H_team_id < A_team_id,
+                       paste(season, H_team_id, A_team_id, sep = "_"),
+                       paste(season, A_team_id, H_team_id, sep = "_"))
+  )
+
+team_data_singlerow <- calculate_combined_records(team_data_singlerow)
+
+team_data_singlerow <- team_data_singlerow %>%
+  select(-win.y, -loss.y,-loss.x, -win.x)
+
+team_data_singlerow <- team_data_singlerow %>%
+  arrange(gamedate)
+
+team_data_singlerow <- team_data_singlerow %>%
+  group_by(H_team) %>%
+  arrange(gamedate) %>%
+  mutate(H_last_7_games_wins = calculate_last_7_games_sum(H_win),
+  H_last_7_games_net_rating = calculate_last_7_games_mean(H_net_rating),
+  H_last_7_games_fg_percent = calculate_last_7_games_mean(H_fg_percent),
+  H_last_7_games_turnover_percent = calculate_last_7_games_mean(H_turnover_percent),
+  H_last_7_games_ORTG = calculate_last_7_games_mean(H_ORTG),
+  H_last_7_games_DRTG = calculate_last_7_games_mean(H_DRTG),
+  H_last_7_games_point_differential = calculate_last_7_games_sum(H_point_differential),
+  H_last_7_games_shooting_fouls_drawn = calculate_last_7_games_sum(H_shooting_fouls_drawn),
+  H_last_7_games_points = calculate_last_7_games_sum(H_points)) %>%
+  ungroup() %>%
+  group_by(A_team) %>%
+  arrange(gamedate) %>%
+  mutate(A_last_7_games_wins = calculate_last_7_games_sum(A_win),
+  A_last_7_games_net_rating = calculate_last_7_games_mean(A_net_rating),
+  A_last_7_games_fg_percent = calculate_last_7_games_mean(A_fg_percent),
+  A_last_7_games_turnover_percent = calculate_last_7_games_mean(A_turnover_percent),
+  A_last_7_games_ORTG = calculate_last_7_games_mean(A_ORTG),
+  A_last_7_games_DRTG = calculate_last_7_games_mean(A_DRTG),
+  A_last_7_games_point_differential = calculate_last_7_games_sum(A_point_differential),
+  A_last_7_games_shooting_fouls_drawn = calculate_last_7_games_sum(A_shooting_fouls_drawn),
+  A_last_7_games_points = calculate_last_7_games_sum(A_points)) %>%
+  ungroup()
+```
+
+
+```{r}
+#Format team_data back to long mode
+home_data <- team_data_singlerow %>%
+  select(starts_with("H_"), gamedate, nbagameid, gametype, season, series_id) %>%
+  rename_with(~ gsub("^H_", "", .x), starts_with("H_")) %>%
+  mutate(team_type = "Home")
+
+away_data <- team_data_singlerow %>%
+  select(starts_with("A_"), gamedate, nbagameid, gametype, season, series_id) %>%
+  rename_with(~ gsub("^A_", "", .x), starts_with("A_")) %>%
+  mutate(team_type = "Away")
+
+team_data_combined <- bind_rows(home_data, away_data) %>%
+  arrange(nbagameid)
+
+#Fix NA
+team_data_combined <- team_data_combined %>%
+  mutate(ft_percent = ifelse(is.na(ft_percent), 0, ft_percent))
+
+#Create total features (idea is to add season long stats to have both local and further past data points to make decisions off of)
+team_data_combined <- team_data_combined %>%
+  group_by(season, team_id) %>%
+  arrange(team_id, gamedate) %>%
+  mutate(
+    fouls = offensivefouls + defensivefouls,
+    season_points = cumsum(points),
+    season_assists = cumsum(assists),
+    season_turnovers = cumsum(turnovers),
+    season_possessions = cumsum(possessions),
+    season_fouls = cumsum(fouls),
+    season_shooting_fouls_drawn = cumsum(shooting_fouls_drawn)
+  )
+
+
+  
+#Joining Player to Team
+cols_to_keep <- c("avg_starter_fg_percent", "avg_starter_ft_percent", "avg_starter_rebound_percent", "avg_starter_assist_turnover_ratio", "avg_starter_efg_percent", "avg_starter_ts_percent",
+                  "avg_starter_turnover_percent", "avg_starter_ORTG", "avg_starter_DRTG", "avg_starter_net_rating", "avg_starter_block_percent", "avg_starter_ft_rate", "avg_starter_BPM",
+                  "avg_starter_PIE", "avg_starter_USG_percent", "avg_starter_assist_percent", "avg_starter_total_games", "avg_starter_injury_frequency", "avg_starter_PER",
+                  "avg_starter_games_played_before","avg_starter_playoff_games_played_before", "avg_starter_win_ratio", "avg_starter_points_per_minutes", "season", "gamedate", "nbateamid")
+
+
+player_data_cols_to_keep <- player_data_aggregate %>%
+  select(all_of(cols_to_keep)) %>%
+  distinct(season, gamedate, nbateamid, .keep_all = TRUE)
+
+team_data_combined <- team_data_combined %>%
+  left_join(player_data_cols_to_keep, by = c("season", "gamedate", "team_id" = "nbateamid"))
+
+
+  
+#Clean after this new join
+na_nbagameid <- team_data_combined %>%
+  filter(is.na(avg_starter_ft_percent)) %>%
+  pull(nbagameid)
+  
+team_data_combined <- team_data_combined %>%
+  filter(!nbagameid %in% na_nbagameid)
+
+```
+
+
+```{r}
+# Filter and arrange team_data_combined
+playoff_team_data_combined <- team_data_combined %>%
+  filter(gametype == 4) 
+  
+# Calculate series wins
+series_wins <- playoff_team_data_combined %>%
+  group_by(series_id, team_id) %>%
+  summarize(team_wins_per_series = sum(win), .groups = 'drop')
+
+# Determine series winner
+series_winner <- series_wins %>%
+  group_by(series_id) %>%
+  summarize(series_winner = ifelse(any(team_wins_per_series >= 4), 1, 0), .groups = 'drop')
+
+# Join series_winner with playoff_team_data_combined
+playoff_team_data_combined <- playoff_team_data_combined %>%
+  left_join(series_winner, by = "series_id")
+
+# Aggregate playoff data to series level
+playoff_series_data <- playoff_team_data_combined %>%
+  group_by(series_id, team_id) %>%
+  arrange(gamedate) %>%
+  summarize(
+    num_games = n(),
+    first_series_date = first(gamedate),
+    gametype = first(gametype),
+    season = first(season),
+    team_id = first(team_id),
+    team_name = first(team_name),
+    win = sum(win),
+    series_win = ifelse(win == 4, 1, 0),
+    opponent_id = first(opponent_id),
+    opponent = first(opponent),
+    avg_points = mean(points, na.rm = TRUE),
+    avg_fg2made = mean(fg2made, na.rm = TRUE),
+    avg_fg2missed = mean(fg2missed, na.rm = TRUE),
+    avg_fg2attempted = mean(fg2attempted, na.rm = TRUE),
+    avg_fg3made = mean(fg3made, na.rm = TRUE),
+    avg_fg3missed = mean(fg3missed, na.rm = TRUE),
+    avg_fg3attempted = mean(fg3attempted, na.rm = TRUE),
+    avg_fgmade = mean(fgmade, na.rm = TRUE),
+    avg_fgmissed = mean(fgmissed, na.rm = TRUE),
+    avg_fgattempted = mean(fgattempted, na.rm = TRUE),
+    avg_ftmade = mean(ftmade, na.rm = TRUE),
+    avg_ftmissed = mean(ftmissed, na.rm = TRUE),
+    avg_ftattempted = mean(ftattempted, na.rm = TRUE),
+    avg_rebound_offensive = mean(rebound_offensive, na.rm = TRUE),
+    avg_rebound_chance = mean(rebound_chance, na.rm = TRUE),
+    avg_assists = mean(assists, na.rm = TRUE),
+    avg_turnovers = mean(turnovers, na.rm = TRUE),
+    avg_offensivefouls = mean(offensivefouls, na.rm = TRUE),
+    avg_shooting_fouls_drawn = mean(shooting_fouls_drawn, na.rm = TRUE),
+    avg_possessions = mean(possessions, na.rm = TRUE),
+    avg_shotattempts = mean(shotattempts, na.rm = TRUE),
+    avg_andones = mean(andones, na.rm = TRUE),
+    avg_shotattemptpoints = mean(shotattemptpoints, na.rm = TRUE),
+    avg_rebound_defensive = mean(rebound_defensive, na.rm = TRUE),
+    avg_steals = mean(steals, na.rm = TRUE),
+    avg_blocks = mean(blocks, na.rm = TRUE),
+    avg_defensivefouls = mean(defensivefouls, na.rm = TRUE),
+    avg_fg_percent = mean(fg_percent, na.rm = TRUE),
+    avg_fg3_percent = mean(fg3_percent, na.rm = TRUE),
+    avg_ft_percent = mean(ft_percent, na.rm = TRUE),
+    avg_turnover_ratio = mean(turnover_ratio, na.rm = TRUE),
+    avg_turnover_percent = mean(turnover_percent, na.rm = TRUE),
+    avg_ORTG = mean(ORTG, na.rm = TRUE),
+    avg_DRTG = mean(DRTG, na.rm = TRUE),
+    avg_net_rating = mean(net_rating, na.rm = TRUE),
+    avg_steal_percentage = mean(steal_percentage, na.rm = TRUE),
+    avg_block_percentage = mean(block_percentage, na.rm = TRUE),
+    avg_efg_percent = mean(efg_percent, na.rm = TRUE),
+    avg_ts_percent = mean(ts_percent, na.rm = TRUE),
+    avg_dreb_percent = mean(dreb_percent, na.rm = TRUE),
+    avg_ppp = mean(ppp, na.rm = TRUE),
+    avg_foul_percent = mean(foul_percent, na.rm = TRUE),
+    sum_point_differential = sum(point_differential, na.rm = TRUE),
+    sum_cumulative_wins = sum(cumulative_wins, na.rm = TRUE),
+    sum_cumulative_losses = sum(cumulative_losses, na.rm = TRUE),
+    cumulative_wins_at_series_start = first(cumulative_wins),
+    cumulative_losses_at_series_start = first(cumulative_losses),
+    first_last_7_games_wins = first(last_7_games_wins),
+    first_last_7_games_net_rating = first(last_7_games_net_rating),
+    first_last_7_games_fg_percent = first(last_7_games_fg_percent),
+    first_last_7_games_turnover_percent = first(last_7_games_turnover_percent),
+    first_last_7_games_ORTG = first(last_7_games_ORTG),
+    first_last_7_games_DRTG = first(last_7_games_DRTG),
+    first_last_7_games_point_differential = first(last_7_games_point_differential),
+    first_last_7_games_shooting_fouls_drawn = first(last_7_games_shooting_fouls_drawn),
+    first_last_7_games_points = first(last_7_games_points),
+    Home_or_Away = first(team_type),
+    avg_fouls = mean(fouls, na.rm = TRUE),
+    first_season_points = first(season_points),
+    first_season_fouls = first(season_fouls),
+    first_season_shooting_fouls_drawn = first(season_shooting_fouls_drawn),
+    avg_starter_fg_percent = mean(avg_starter_fg_percent, na.rm = TRUE),
+    avg_starter_ft_percent = mean(avg_starter_ft_percent, na.rm = TRUE),
+    avg_starter_rebound_percent = mean(avg_starter_rebound_percent, na.rm = TRUE),
+    avg_starter_assist_turnover_ratio = mean(avg_starter_assist_turnover_ratio, na.rm = TRUE),
+    avg_starter_efg_percent = mean(avg_starter_efg_percent, na.rm = TRUE),
+    avg_starter_ts_percent = mean(avg_starter_ts_percent, na.rm = TRUE),
+    avg_starter_turnover_percent = mean(avg_starter_turnover_percent, na.rm = TRUE),
+    avg_starter_ORTG = mean(avg_starter_ORTG, na.rm = TRUE),
+    avg_starter_DRTG = mean(avg_starter_DRTG, na.rm = TRUE),
+    avg_starter_net_rating = mean(avg_starter_net_rating, na.rm = TRUE),
+    avg_starter_block_percent = mean(avg_starter_block_percent, na.rm = TRUE),
+    avg_starter_ft_rate = mean(avg_starter_ft_rate, na.rm = TRUE),
+    avg_starter_BPM = mean(avg_starter_BPM, na.rm = TRUE),
+    avg_starter_PIE = mean(avg_starter_PIE, na.rm = TRUE),
+    avg_starter_USG_percent = mean(avg_starter_USG_percent, na.rm = TRUE),
+    avg_starter_assist_percent = mean(avg_starter_assist_percent, na.rm = TRUE),
+    avg_starter_total_games = mean(avg_starter_total_games, na.rm = TRUE),
+    avg_starter_injury_frequency = mean(avg_starter_injury_frequency, na.rm = TRUE),
+    avg_starter_PER = mean(avg_starter_PER, na.rm = TRUE),
+    avg_starter_games_played_before = mean(avg_starter_games_played_before, na.rm = TRUE),
+    avg_starter_playoff_games_played_before = mean(avg_starter_playoff_games_played_before, na.rm = TRUE),
+    avg_starter_win_ratio = mean(avg_starter_win_ratio, na.rm = TRUE),
+    avg_starter_points_per_minutes = mean(avg_starter_points_per_minutes, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+playoff_series_data_2019 <- playoff_series_data %>%
+  filter(season < 2020)
+
+playoff_series_data_2019 <- playoff_series_data_2019 %>%
+  arrange(series_id)
+
+
+
+```
+
+# Step 2: Modelling
+
+## Part A.) Normalization and Feature Selection in order to predict series_win and num_games
+
+* Overall Plan: Normalize (scale) our data. Choose models to predict our two targets (series_win (win probability), num_games). Perform feature selection customary to the model chosen. Finally assess which model is best.
+
+```{r}
+# Load Models and Functions
+
+library(glmnet)
+library(caret)
+library(pROC)
+library(xgboost)
+library(ggplot2)
+library(reshape2)
+library(randomForest)
+
+```
+
+```{r}
+#Data Normalization
+playoff_series_data_2019 <- playoff_series_data_2019 %>%
+  arrange(first_series_date)
+
+# Remove identifiers from feature set
+identifiers <- playoff_series_data_2019 %>%
+  select(series_id, team_id, gametype, team_name, opponent_id, opponent, first_series_date)
+
+playoff_series_data_features <- playoff_series_data_2019 %>%
+  select(-series_id, -team_id, -gametype, -team_name, -opponent_id, -opponent, -win)
+
+playoff_series_data_features <- playoff_series_data_features %>%
+  filter(is.finite(avg_starter_ft_rate))
+
+identifiers <- identifiers[is.finite(playoff_series_data_2019$avg_starter_ft_rate), ]
+
+# Define cut-off date for training and test sets
+cut_off_date <- as.Date("2017-04-14")
+
+train_identifiers <- identifiers %>% filter(first_series_date <= cut_off_date)
+test_identifiers <- identifiers %>% filter(first_series_date > cut_off_date)
+
+# Split the data into training and test sets based on the cut-off date
+train_data <- playoff_series_data_features %>% filter(first_series_date <= cut_off_date)
+test_data <- playoff_series_data_features %>% filter(first_series_date > cut_off_date)
+
+train_data <- train_data %>%
+  mutate(series_win = ifelse(series_win >= 0.5, 1, 0))
+
+test_data <- test_data %>%
+  mutate(series_win = ifelse(series_win >= 0.5, 1, 0))
+
+train_data <- train_data %>%
+  mutate(Home_or_Away = ifelse(Home_or_Away == "Home", 1, 0))
+
+test_data <- test_data %>%
+  mutate(Home_or_Away = ifelse(Home_or_Away == "Home", 1, 0))
+
+# Normalize the features
+preProc <- preProcess(train_data %>% select(-series_win, -num_games), method = c("center", "scale"))
+train_features_norm <- predict(preProc, train_data %>% select(-series_win, -num_games))
+test_features_norm <- predict(preProc, test_data %>% select(-series_win, -num_games))
+
+train_features_norm$first_series_date <- as.numeric(as.Date(train_data$first_series_date))
+test_features_norm$first_series_date <- as.numeric(as.Date(test_data$first_series_date))
+
+nzv <- nearZeroVar(train_features_norm, saveMetrics = TRUE)
+train_features_norm <- train_features_norm[, !nzv$nzv]
+test_features_norm <- test_features_norm[, !nzv$nzv]
+
+cor_matrix <- cor(train_features_norm)
+highly_correlated <- findCorrelation(cor_matrix, cutoff = 0.9)
+train_features_norm <- train_features_norm[, -highly_correlated]
+test_features_norm <- test_features_norm[, -highly_correlated]
+
+# Add the target variable back 
+train_data_norm <- cbind(train_features_norm, series_win = train_data$series_win, num_games = train_data$num_games)
+test_data_norm <- cbind(test_features_norm, series_win = test_data$series_win, num_games = test_data$num_games)
+
+train_data_norm$series_win <- as.factor(train_data_norm$series_win)
+test_data_norm$series_win <- as.factor(test_data_norm$series_win)
+
+```
+
+
+```{r}
+# Feature Selection for Series_win
+
+control_lr <- rfeControl(functions = lrFuncs, method = "cv", number = 10)
+
+results_win_lr <- rfe(
+  x = train_data_norm %>% select(-series_win, -num_games), 
+  y = train_data_norm$series_win,
+  sizes = c(1:35), 
+  rfeControl = control_lr
+)
+
+selected_features_win_lr <- predictors(results_win_lr)
+print(selected_features_win_lr)
+```
+
+
+```{r}
+# Feature Selection for num_games
+control_lm <- rfeControl(functions = lmFuncs, method = "cv", number = 10)
+
+results_games_lm <- rfe(
+  x = train_data_norm %>% select(-series_win, -num_games), 
+  y = train_data_norm$num_games,
+  sizes = c(1:35), 
+  rfeControl = control_lm
+)
+
+
+selected_features_games_lm <- predictors(results_games_lm)
+print(selected_features_games_lm)
+
+```
+
+## Part B.) Fitting both log reg model (win_series) and linear reg (num_games) and then analysis
+
+
+```{r}
+# LOGISTIC REGRESSION FOR SERIES WINNER WITH ANALYSIS
+
+# Fit logistic regression model
+cv_fit_win <- cv.glmnet(as.matrix(train_data_norm %>% select(all_of(selected_features_win_lr))), 
+                        train_data_norm$series_win, family = "binomial", alpha = 1)
+
+# Predict probabilities 
+win_probabilities <- predict(cv_fit_win, newx = as.matrix(test_data_norm %>% select(all_of(selected_features_win_lr))), 
+                             s = "lambda.min", type = "response")
+
+predicted_classes <- ifelse(win_probabilities > 0.5, 1, 0)
+
+# Measurments
+conf_matrix <- confusionMatrix(as.factor(predicted_classes), as.factor(test_data_norm$series_win))
+precision <- posPredValue(as.factor(predicted_classes), as.factor(test_data_norm$series_win))
+recall <- sensitivity(as.factor(predicted_classes), as.factor(test_data_norm$series_win))
+f1_score <- 2 * (precision * recall) / (precision + recall)
+
+roc_curve <- roc(test_data_norm$series_win, win_probabilities)
+auc_roc <- auc(roc_curve)
+
+# Print metrics
+print(conf_matrix)
+print(paste("Precision:", round(precision, 3)))
+print(paste("Recall:", round(recall, 3)))
+print(paste("F1 Score:", round(f1_score, 3)))
+print(paste("AUC-ROC:", round(auc_roc, 3)))
+
+# Plot ROC Curve
+plot(roc_curve, main = "ROC Curve for Logistic Regression", col = "blue")
+abline(a = 0, b = 1, lty = 2, col = "red")
+
+```
+
+
+```{r}
+# LINEAR REGRESSION FOR NUMBER OF GAMES
+
+train_data_norm$num_games <- as.numeric(as.character(train_data_norm$num_games))
+test_data_norm$num_games <- as.numeric(as.character(test_data_norm$num_games))
+
+# Fit linear regression model
+games_model <- lm(num_games ~ ., data = train_data_norm %>% select(all_of(selected_features_games_lm), num_games))
+
+predicted_games <- predict(games_model, newdata = test_data_norm %>% select(all_of(selected_features_games_lm)))
+
+predicted_games <- round(predicted_games)
+
+# Clamp predictions to be between 4 and 7
+predicted_games <- pmax(pmin(predicted_games, 7), 4)
+
+# Calculate RMSE for linear regression predictions
+lin_rmse <- sqrt(mean((predicted_games - test_data_norm$num_games)^2))
+
+print(paste("Linear Regression RMSE:", round(lin_rmse, 2)))
+
+```
+
+## Part C.) Fitting both random forests model (win_series) and (num_games) and then analysis
+
+```{r}
+# RANDOM FORESTS MODEL FOR SERIES WINNER
+
+# Perform RFE to select top features 
+control_rf <- rfeControl(functions = rfFuncs, method = "cv", number = 10)  
+
+results_win_rf <- rfe(train_data_norm %>% select(-series_win, -num_games), train_data_norm$series_win,
+                      sizes = c(1:35), rfeControl = control_rf)
+
+selected_features_win_rf <- predictors(results_win_rf)
+
+# Fit Random Forest model 
+rf_win_model <- randomForest(as.factor(series_win) ~ ., data = train_data_norm %>% select(all_of(selected_features_win_rf), series_win), ntree = 100)
+rf_win_predictions <- predict(rf_win_model, newdata = test_data_norm %>% select(all_of(selected_features_win_rf)))
+rf_win_probabilities <- predict(rf_win_model, newdata = test_data_norm %>% select(all_of(selected_features_win_rf)), type = "prob")[,2]
+
+# Measurments
+rf_conf_matrix <- confusionMatrix(rf_win_predictions, as.factor(test_data_norm$series_win))
+rf_roc_curve <- roc(test_data_norm$series_win, rf_win_probabilities)
+rf_auc <- auc(rf_roc_curve)
+
+rf_precision <- rf_conf_matrix$byClass['Pos Pred Value']
+rf_recall <- rf_conf_matrix$byClass['Sensitivity']
+rf_f1 <- 2 * ((rf_precision * rf_recall) / (rf_precision + rf_recall))
+
+print(rf_conf_matrix)
+print(paste("Random Forest AUC-ROC:", rf_auc))
+
+
+print(paste("Precision:", round(rf_precision, 3)))
+print(paste("Recall:", round(rf_recall, 3)))
+print(paste("F1 Score:", round(rf_f1, 3)))
+print(paste("AUC-ROC:", round(rf_auc, 3)))
+
+
+```
+
+```{r}
+#RANDOM FORESTS FOR NUMBER OF GAMES
+
+
+results_games_rf <- rfe(train_data_norm %>% select(-series_win, -num_games), train_data_norm$num_games,
+                        sizes = c(1:35), rfeControl = control_rf)
+
+selected_features_games_rf <- predictors(results_games_rf)
+
+# Fit Random Forest model 
+rf_games_model <- randomForest(num_games ~ ., data = train_data_norm %>% select(all_of(selected_features_games_rf), num_games), ntree = 100)
+rf_predicted_games <- predict(rf_games_model, newdata = test_data_norm %>% select(all_of(selected_features_games_rf)))
+
+rf_predicted_games <- pmax(pmin(round(rf_predicted_games), 7), 4)
+
+# Measurements
+rf_mae <- mean(abs(rf_predicted_games - test_data_norm$num_games))
+rf_mse <- mean((rf_predicted_games - test_data_norm$num_games)^2)
+rf_rmse <- sqrt(rf_mse)
+
+print(paste("Random Forest MAE:", round(rf_mae, 2)))
+print(paste("Random Forest MSE:", round(rf_mse, 2)))
+print(paste("Random Forest RMSE:", round(rf_rmse, 2)))
+
+
+```
+
+
+
+## Part D.) Visualizations comparing Models
+* Based on the plot below I decided to use the logistic regression model for predicting series_win (win_percentage) and random forests for num_games (number of games in series)
+```{r}
+
+model_names <- c("Log / Lin Regression", "Random Forest")
+F1_scores <- c(f1_score, rf_f1)  # Ensure these variables are defined
+auc_values <- c(auc_roc, rf_auc)  # Ensure these variables are defined
+rmse_values <- c(lin_rmse, rf_rmse)  # Ensure these variables are defined
+
+auc_data <- data.frame(
+  Model = model_names,
+  Metric = "AUC-ROC",
+  Value = auc_values
+)
+
+f1_data <- data.frame(
+  Model = model_names,
+  Metric = "F1-Score",
+  Value = F1_scores
+)
+
+rmse_data <- data.frame(
+  Model = model_names,
+  Metric = "RMSE",
+  Value = rmse_values
+)
+
+plot_data <- rbind(auc_data, f1_data, rmse_data)
+
+ggplot(plot_data, aes(x = Model, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Model Performance Comparison",
+       x = "Model",
+       y = "Value") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  ) +
+  scale_fill_manual(values = c("AUC-ROC" = "blue", "F1-Score" = "red", "RMSE" = "green"))
+
+
+
+```
+## Part E.) Visualizations for 2022 Playoff Predictions
+* Overall Plan: Inpute 2022 playoffs data into the two models, then create box plot with all teams that made it to the playoffs.
+
+```{r}
+# Filter playoff series data for the 2022 season
+playoff_series_data_2022 <- playoff_series_data %>%
+  filter(season == 2022)
+
+identifiers_2022 <- playoff_series_data_2022 %>%
+  select(series_id, team_id, gametype, team_name, opponent_id, opponent, first_series_date)
+
+playoff_series_features_2022 <- playoff_series_data_2022 %>%
+  select(-series_id, -team_id, -gametype, -team_name, -opponent_id, -opponent, -series_win)
+
+finite_filter <- is.finite(playoff_series_features_2022$avg_starter_ft_rate)
+playoff_series_features_2022 <- playoff_series_features_2022[finite_filter, ]
+identifiers_2022 <- identifiers_2022[finite_filter, ]
+
+playoff_series_features_2022 <- playoff_series_features_2022 %>%
+  mutate(Home_or_Away = ifelse(Home_or_Away == "Home", 1, 0))
+
+series_win <- playoff_series_data_2022$series_win[finite_filter]
+num_games <- playoff_series_data_2022$num_games[finite_filter]
+
+preProc_2022 <- preProcess(playoff_series_features_2022, method = c("center", "scale"))
+playoff_features_norm_2022 <- predict(preProc_2022, playoff_series_features_2022)
+
+playoff_features_norm_2022$first_series_date <- as.numeric(as.Date(playoff_series_features_2022$first_series_date))
+
+playoff_data_norm_2022 <- cbind(playoff_features_norm_2022, series_win = series_win, num_games = num_games)
+
+playoff_data_norm_2022$series_win <- as.factor(playoff_data_norm_2022$series_win)
+```
+
+```{r}
+# Model Creations
+win_probabilities_2022 <- predict(cv_fit_win, newx = as.matrix(playoff_data_norm_2022 %>% select(all_of(selected_features_win_lr))), 
+                                  s = "lambda.min", type = "response")
+
+predicted_games_2022 <- predict(rf_games_model, newdata = playoff_data_norm_2022 %>% select(all_of(selected_features_games_rf)))
+predicted_games_2022 <- pmax(pmin(round(predicted_games_2022), 7), 4)
+
+predictions_2022 <- identifiers_2022 %>%
+  mutate(predicted_win_prob = win_probabilities_2022,
+         predicted_num_games = predicted_games_2022)
+```
+
+```{r}
+# Visualization Creation
+
+teams <- unique(c(predictions_2022$team_name, predictions_2022$opponent))
+advancement_probabilities <- data.frame(
+  team = teams,
+  round_1 = rep(0, length(teams)),
+  round_2 = rep(0, length(teams)),
+  round_3 = rep(0, length(teams)),
+  round_4 = rep(0, length(teams))
+)
+
+for (team in teams) {
+  round_1_prob <- predictions_2022 %>%
+    filter(team_name == team | opponent == team) %>%
+    summarise(prob = sum(predicted_win_prob)) %>%
+    pull(prob)
+  
+  round_2_prob <- round_1_prob * 0.5  # Assuming independent probabilities, adjust as needed
+  round_3_prob <- round_2_prob * 0.5
+  round_4_prob <- round_3_prob * 0.5
+  
+  advancement_probabilities <- advancement_probabilities %>%
+    mutate(
+      round_1 = ifelse(team == !!team, round_1_prob, round_1),
+      round_2 = ifelse(team == !!team, round_2_prob, round_2),
+      round_3 = ifelse(team == !!team, round_3_prob, round_3),
+      round_4 = ifelse(team == !!team, round_4_prob, round_4)
+    )
+}
+
+advancement_probabilities_melted <- melt(advancement_probabilities, id.vars = "team")
+
+ggplot(advancement_probabilities_melted, aes(x = team, y = value, fill = variable)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Advancement Probabilities for 2024 NBA Playoffs", x = "Team", y = "Probability", fill = "Round") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+## Part F: Model Debrief 
+
+### Overview of Part 2
+
+#### Data Manipulation
+
+##### Player Data
+- **Datasets Used**: `team_data` and `player_data`.
+- **Aggregation**: Individual player data from team starters was averaged to bring it to the team level and then to the series level. Features related to this are tagged as "avg_starter".
+
+##### Team Data
+- **Aggregation**: Data was aggregated into a single column format with home and away stats. New features were created when the data was in a single row, then split back into two separate rows distinguished by team, providing offense and defense stats for each team in the same row.
+
+#### Feature Engineering
+Features created include team aggregates, avg_starter aggregates, last_7_games aggregates, and past_season aggregates. This approach allows the model to determine which time frames are most important for different stats. Examples include:
+
+- `avg_starter_playoff_games_played_before`: Sums the number of playoff games each starter had played before and averages it.
+- `avg_ppp`: Team-level aggregation for Points Per Possession, averaged across the series.
+- `first_last_7_games_point_differential`: Sums the team's point differential over the past 7 games.
+- `first_season_shooting_fouls_drawn`: Season-long aggregate of the sum of shooting fouls drawn by the team.
+
+#### Normalization
+After data cleaning, feature engineering, and formatting, all data was normalized to ensure comparable scales across all features.
+
+### Model Creation
+
+#### Win Probability Model
+- **Model Used**: Logistic Regression.
+- **Feature Selection**: Recursive feature elimination (RFE) was used to identify the most relevant features, ensuring the model remains interpretable and simple.
+- **Validation**: Cross-validation was used to tune the regularization parameter, ensuring robust performance across different subsets of data.
+- **Comparison**: The logistic regression model was compared with a random forest model. Although both performed similarly, the logistic regression model was preferred for its simplicity and ability to pick up important trends without becoming overfit or overly complex.
+
+#### Number of Games Model
+- **Model Used**: Random Forest.
+- **Performance**: The random forest model performed significantly better than a linear regression model.
+- **Feature Selection**: RFE was used for feature selection, and cross-validation was applied to avoid overfitting.
+
+### Strengths of the Model
+- **Comprehensive Metrics**: The model uses a comprehensive selection of performance metrics to capture all aspects of team performance during the playoffs.
+- **Feature Selection**: Implementing a feature selection process ensures only the most relevant features are included in the final model.
+- **Adaptability**: The model is designed to be easily updated with new data, ensuring it remains accurate and relevant for future seasons.
+
+### Weaknesses of the Model
+- **Lack of Injury Data**: The model does not include an effective feature for capturing injury updates, which are critical for team performance.
+- **Potential Overfitting**: Despite cross-validation efforts, the model shows signs of overfitting, often assigning high probabilities (80-90%+) to predicted winners. While it performs well on unseen data (88-92% accuracy), this confidence may indicate overfitting.
+- **Convoluted Data Aggregation**: Aggregating player data to the series level was somewhat convoluted, involving multiple averaging steps. A cleaner method would have been preferable.
+- **No Coaching Data**: The model lacks information on coaches' records, which could provide insights into the significance of coaching on playoff outcomes.
+- **Complex Data Manipulation**: The data manipulation process in the code is overly complicated. Cleaner, more direct coding practices would improve efficiency and understanding.
+
+### Addressing the Weaknesses
+- **Regularization Techniques**: To address overfitting, ridge and lasso regression were attempted to penalize overly complex models, but simpler models were ultimately chosen.
+- **Inclusion of Regular Season Data**: Including regular season data would provide a more comprehensive view of team performance and reduce overfitting by expanding the dataset.
+- **Cleaner Coding Practices**: Adopting cleaner coding practices would make the data processing pipeline more efficient and maintainable.
+- **Effective Injury Data Features**: Implementing features such as real-time injury reports and historical data would improve the model’s accuracy by accounting for the impact of player absences.
+
+Enhancing the model with these improvements—using regular season data, cleaner code, and better injury features—would significantly boost its predictive accuracy and reliability.
